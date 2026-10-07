@@ -5,6 +5,7 @@ import { RulesView } from './features/rules/RulesView';
 import { SamplesView } from './features/samples/SamplesView';
 import { InspectionView } from './features/inspection/InspectionView';
 import { createRuleWeaveViewModels } from './viewmodels/createRuleWeaveViewModels';
+import { isAnalysisFresh } from './viewmodels/workspaceViewModel';
 import './styles.css';
 
 const navigation: { id: ModuleId; label: string; description: string; icon: string; step: string }[] = [
@@ -20,6 +21,12 @@ export default function App() {
   const state = useSyncExternalStore(workspace.subscribe, workspace.getSnapshot, workspace.getSnapshot);
   const project = state.project;
   const activeNavigation = navigation.find((item) => item.id === state.activeModule) ?? navigation[0];
+  const resultFresh = isAnalysisFresh(state);
+  const resultStale = state.analysis !== null && !resultFresh;
+  const healthTone = state.validationIssues.length ? 'health-badge health-warn' : resultStale ? 'health-badge health-stale' : state.checkStatus === 'success' ? 'health-badge health-good' : 'health-badge';
+  const healthLabel = state.validationIssues.length ? '待修复' : resultStale ? '结论已过期' : state.checkStatus === 'success' ? '已检查' : '草稿';
+  const phaseLabel = state.phase === 'checking' ? '检查中' : state.phase === 'validating' ? '需要修复' : state.phase === 'error' ? '发生错误' : project?.frozenVersionId ? '已冻结' : resultStale ? '结论已过期' : state.phase === 'ready' ? '检查通过' : '编辑中';
+  const phaseClass = `phase-badge phase-${state.phase}${resultStale ? ' phase-stale' : ''}`;
 
   useEffect(() => {
     void workspace.start();
@@ -38,7 +45,7 @@ export default function App() {
         <div className="brand-lockup"><div className="brand-mark"><span /><span /><span /></div><div><strong>RuleWeave</strong><small>RULE SYSTEM STUDIO</small></div></div>
         <div className="project-switcher"><span className="eyebrow">当前项目</span><select aria-label="切换项目" value={project?.id ?? ''} disabled={!state.workspace} onChange={(event) => workspace.switchProject(event.target.value)}>{state.workspace?.projects.map((item) => <option value={item.id} key={item.id}>{item.title}</option>)}</select><span className="project-status"><i />本地工作区</span></div>
         <div className="sidebar-spacer" />
-        <div className="project-health"><div className="health-header"><span>项目状态</span><span className={state.validationIssues.length ? 'health-badge health-warn' : state.checkStatus === 'success' ? 'health-badge health-good' : 'health-badge'}>{state.validationIssues.length ? '待修复' : state.checkStatus === 'success' ? '已检查' : '草稿'}</span></div><div className="health-track"><span style={{ width: `${state.validationIssues.length ? 38 : project?.rules.length ? 84 : 16}%` }} /></div><small>{state.validationIssues.length ? '存在定义问题，无法运行检查' : project?.rules.length ? `${project.rules.length} 条规则 · 可继续编辑` : '先定义字段和规则'}</small></div>
+        <div className="project-health"><div className="health-header"><span>项目状态</span><span className={healthTone}>{healthLabel}</span></div><div className="health-track"><span style={{ width: `${state.validationIssues.length ? 38 : project?.rules.length ? 84 : 16}%` }} /></div><small>{state.validationIssues.length ? '存在定义问题，无法运行检查' : resultStale ? '展示的是旧结构的结论，正在等待重新检查' : project?.rules.length ? `${project.rules.length} 条规则 · 可继续编辑` : '先定义字段和规则'}</small></div>
         <button className="new-project-button" onClick={() => workspace.createProject()}><span>＋</span> 新建规则项目</button>
         <footer className="sidebar-footer"><span className="avatar-dot">R</span><span><strong>本地规则空间</strong><small>所有数据保存在此浏览器</small></span><span className="local-lock">⌑</span></footer>
       </aside>
@@ -46,7 +53,7 @@ export default function App() {
       <main className="main-area">
         <header className="topbar"><div className="breadcrumb"><span>规则项目</span><b>/</b><strong>{activeNavigation.label}</strong></div><div className="topbar-right"><span className="save-indicator"><i className={state.persistence === 'saving' ? 'save-dot is-saving' : state.persistence === 'error' ? 'save-dot save-error' : 'save-dot'} />{state.persistence === 'saving' ? '保存中' : state.persistence === 'error' ? '保存失败' : '已保存'}</span><span className="topbar-divider" /><button className="avatar-button" aria-label="用户菜单">RW</button></div></header>
         {project && <div className="content-wrap">
-          <div className="project-title-bar"><div className="project-title-copy"><span className="project-kicker">RULE PROJECT / LOCAL</span><input aria-label="项目名称" value={project.title} onChange={(event) => workspace.renameProject(event.target.value)} /><span className="project-subtitle">规则逻辑空间 <span>·</span> 最后修改 {new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(project.updatedAt)}</span></div><div className="title-bar-actions"><span className={`phase-badge phase-${state.phase}`}>{state.phase === 'checking' ? '检查中' : state.phase === 'validating' ? '需要修复' : state.phase === 'error' ? '发生错误' : project.frozenVersionId ? '已冻结' : state.phase === 'ready' ? '检查通过' : '编辑中'}</span><button className="title-more-button" aria-label="创建项目" title="新建项目" onClick={() => workspace.createProject()}>＋</button></div></div>
+          <div className="project-title-bar"><div className="project-title-copy"><span className="project-kicker">RULE PROJECT / LOCAL</span><input aria-label="项目名称" value={project.title} onChange={(event) => workspace.renameProject(event.target.value)} /><span className="project-subtitle">规则逻辑空间 <span>·</span> 最后修改 {new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(project.updatedAt)}</span></div><div className="title-bar-actions"><span className={phaseClass}>{phaseLabel}</span><button className="title-more-button" aria-label="创建项目" title="新建项目" onClick={() => workspace.createProject()}>＋</button></div></div>
           {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}{state.saveError && <small>{state.saveError}</small>}</div>}
           <div className="module-tabs" role="tablist" aria-label="规则项目功能模块">
             {navigation.map((item, index) => <button id={`module-tab-${item.id}`} key={item.id} role="tab" aria-selected={state.activeModule === item.id} aria-controls="module-panel" tabIndex={state.activeModule === item.id ? 0 : -1} className={`module-tab${state.activeModule === item.id ? ' module-tab-active' : ''}`} onClick={() => workspace.navigate(item.id)} onKeyDown={(event) => {

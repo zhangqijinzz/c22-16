@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
-import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
+import { structureSignature } from '../domain/structureFingerprint';
+import type { RuleAnalysis, RuleProject, WorkspaceDocument } from '../models/ruleModel';
 import type { CheckOperation } from '../services/ruleCheckService';
-import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
+import { RuleWorkspaceViewModel, isAnalysisFresh } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
@@ -23,6 +24,35 @@ class FakeChecker {
       return { promise: Promise.reject(error), cancel: () => { this.cancelled = true; } };
     }
     return { promise: Promise.resolve(analyzeRules(project)), cancel: () => { this.cancelled = true; } };
+  }
+}
+
+class DeferredChecker {
+  readonly operations: { project: RuleProject; resolve: (analysis: RuleAnalysis) => void; reject: (error: Error) => void; cancelled: boolean }[] = [];
+
+  run(project: RuleProject): CheckOperation {
+    const entry: { project: RuleProject; resolve: (analysis: RuleAnalysis) => void; reject: (error: Error) => void; cancelled: boolean } = {
+      project,
+      resolve: () => undefined,
+      reject: () => undefined,
+      cancelled: false,
+    };
+    const promise = new Promise<RuleAnalysis>((resolve, reject) => {
+      entry.resolve = resolve;
+      entry.reject = reject;
+    });
+    this.operations.push(entry);
+    return { promise, cancel: () => { entry.cancelled = true; entry.reject(new DOMException('cancelled', 'AbortError')); } };
+  }
+
+  resolveLatest(): void {
+    const entry = this.operations.at(-1);
+    if (entry) entry.resolve(analyzeRules(entry.project));
+  }
+
+  resolveAt(index: number): void {
+    const entry = this.operations[index];
+    if (entry) entry.resolve(analyzeRules(entry.project));
   }
 }
 
@@ -99,6 +129,67 @@ describe('RuleWorkspaceViewModel', () => {
     workspace.copyVersionToProject(savedVersion?.id ?? '');
     expect(workspace.getSnapshot().workspace?.projects).toHaveLength(2);
     expect(workspace.getSnapshot().project?.fields).toHaveLength(3);
+    workspace.dispose();
+  });
+
+  it('binds each check to the structure and keeps the final result aligned with the last edit', async () => {
+    const checker = new DeferredChecker();
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), checker);
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(60);
+    checker.resolveLatest();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(true);
+    const firstStructureId = workspace.getSnapshot().structureId;
+
+    // 第一次结构编辑：旧结论保留但标记过期，并自动重算。
+    const project = workspace.getSnapshot().project as RuleProject;
+    workspace.commitProject({ ...project, rules: project.rules.slice(0, 2) }, '删除规则');
+    expect(workspace.getSnapshot().analysis).not.toBeNull();
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(false);
+    expect(workspace.getSnapshot().structureId).not.toBe(firstStructureId);
+    await vi.advanceTimersByTimeAsync(220);
+    expect(checker.operations).toHaveLength(2);
+
+    // 重算返回前再次编辑：针对中间结构的检查作废，结论仍对应第一版结构。
+    const midStructureId = workspace.getSnapshot().structureId;
+    const edited = workspace.getSnapshot().project as RuleProject;
+    workspace.commitProject({ ...edited, rules: edited.rules.slice(0, 1) }, '再删一条');
+    const lastStructureId = workspace.getSnapshot().structureId;
+    expect(lastStructureId).not.toBe(midStructureId);
+    await vi.advanceTimersByTimeAsync(220);
+    expect(checker.operations).toHaveLength(3);
+
+    // 中间结构的结论迟到落地：必须被作废，且不能盖住界面。
+    checker.resolveAt(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(workspace.getSnapshot().analysisStructureId).toBe(firstStructureId);
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(false);
+
+    // 最后一版结构的检查落地：最终展示必须对应最后一次改动。
+    checker.resolveAt(2);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(workspace.getSnapshot().analysisStructureId).toBe(lastStructureId);
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(true);
+    workspace.dispose();
+  });
+
+  it('treats only structural edits as changes: title and sample edits keep the result fresh', async () => {
+    const checker = new FakeChecker();
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), checker);
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(60);
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(true);
+    const boundId = workspace.getSnapshot().analysisStructureId;
+
+    const project = workspace.getSnapshot().project as RuleProject;
+    workspace.renameProject('仅改标题');
+    expect(workspace.getSnapshot().structureId).toBe(structureSignature(project));
+    expect(isAnalysisFresh(workspace.getSnapshot())).toBe(true);
+    expect(workspace.getSnapshot().analysisStructureId).toBe(boundId);
     workspace.dispose();
   });
 });

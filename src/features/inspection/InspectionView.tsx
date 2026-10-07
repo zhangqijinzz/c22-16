@@ -1,5 +1,7 @@
 import type { BusinessRule, RuleAnalysis, RuleProject, RuleVersion, SampleInput } from '../../models/ruleModel';
+import { shortStructureId } from '../../domain/structureFingerprint';
 import type { WorkspaceState } from '../../viewmodels/workspaceViewModel';
+import { isAnalysisFresh } from '../../viewmodels/workspaceViewModel';
 import type { InspectionViewModel } from './inspectionViewModel';
 
 interface InspectionViewProps { state: WorkspaceState; viewModel: InspectionViewModel; onOpenRule: (ruleId: string) => void }
@@ -8,19 +10,33 @@ export function InspectionView({ state, viewModel, onOpenRule }: InspectionViewP
   const project = state.project;
   const analysis = state.analysis;
   const isChecking = state.checkStatus === 'checking' || state.checkStatus === 'scheduled';
+  const fresh = isAnalysisFresh(state);
+  const stale = analysis !== null && !fresh;
   const rules = project?.rules ?? [];
   const byId = new Map(rules.map((rule) => [rule.id, rule]));
   return (
     <section className="module-page inspection-page">
       <div className="page-heading">
         <div><span className="eyebrow">模块 04 / 完整性验证</span><h1>检查与版本</h1><p>定位冲突、遮蔽与遗漏，再保存或冻结一个可追溯版本。</p></div>
-        <div className="button-row">{isChecking ? <button className="button button-quiet" onClick={() => viewModel.cancel()}>取消检查</button> : <button className="button button-primary" disabled={!rules.length || state.validationIssues.length > 0} onClick={() => void viewModel.check()}><span>⌕</span> 运行一致性检查</button>}</div>
+        <div className="button-row">{isChecking ? <button className="button button-quiet" onClick={() => viewModel.cancel()}>取消检查</button> : <button className="button button-primary" disabled={!rules.length || state.validationIssues.length > 0 || fresh} onClick={() => void viewModel.check()}><span>⌕</span> 运行一致性检查</button>}</div>
       </div>
 
       {state.validationIssues.length > 0 && <div className="validation-banner"><strong>规则暂时无法检查</strong><span>{state.validationIssues[0].message}</span><button className="text-button" onClick={() => state.validationIssues[0].ruleId ? onOpenRule(state.validationIssues[0].ruleId) : undefined}>{state.validationIssues[0].ruleId ? '打开相关规则 →' : '修复项目定义'}</button></div>}
       {state.checkStatus === 'error' && !state.validationIssues.length && <div className="error-banner">检查失败：{state.notice}</div>}
-      {!analysis && !state.validationIssues.length && <div className="loading-analysis card-surface"><div className={isChecking ? 'spinner' : 'analysis-orb'}>{isChecking ? '' : '✳'}</div><div><strong>{isChecking ? '正在分析条件空间' : '准备检查规则集合'}</strong><p>{isChecking ? '计算在独立工作线程中运行，可随时取消。' : '点击“运行一致性检查”查看覆盖与规则关系。'}</p></div>{state.checkStatus === 'success' && <span className="success-mark">✓</span>}</div>}
-      {analysis && <AnalysisPanel analysis={analysis} project={project as RuleProject} byId={byId} onOpenRule={onOpenRule} />}
+
+      {stale && <div className="stale-banner" role="status">
+        <span className="stale-icon">⏱</span>
+        <div className="stale-copy">
+          <strong>以下结论已过期</strong>
+          <span>结论基于结构 <code>{shortStructureId(state.analysisStructureId ?? '')}</code>，当前结构已变为 <code>{state.structureId ? shortStructureId(state.structureId) : '—'}</code>{state.checkedAt ? ` · 完成于 ${formatTime(state.checkedAt)}` : ''}。</span>
+        </div>
+        {isChecking
+          ? <span className="stale-state stale-state-pending"><i className="spinner" /> 正在按最新结构重新计算…</span>
+          : <button className="text-button" onClick={() => void viewModel.check()}>立即重新检查 →</button>}
+      </div>}
+
+      {!analysis && !state.validationIssues.length && <div className="loading-analysis card-surface"><div className={isChecking ? 'spinner' : 'analysis-orb'}>{isChecking ? '' : '✳'}</div><div><strong>{isChecking ? '正在分析条件空间' : '准备检查规则集合'}</strong><p>{isChecking ? `计算在独立工作线程中运行，可随时取消 · 目标结构 ${state.structureId ? shortStructureId(state.structureId) : '—'}` : '点击“运行一致性检查”查看覆盖与规则关系。'}</p></div>{state.checkStatus === 'success' && <span className="success-mark">✓</span>}</div>}
+      {analysis && <div className={stale ? 'analysis-stale' : undefined}><AnalysisPanel analysis={analysis} project={project as RuleProject} byId={byId} onOpenRule={onOpenRule} fresh={fresh} analysisStructureId={state.analysisStructureId} currentStructureId={state.structureId} checkedAt={state.checkedAt} /></div>}
 
       <section className="versions-section">
         <div className="versions-heading"><div><span className="eyebrow">CHANGE HISTORY</span><h2>规则版本</h2><p>保存检查前后的结构快照。冻结后，当前规则只能通过复制版本继续修改。</p></div><div className="button-row"><button className="button button-subtle" disabled={!rules.length} onClick={() => viewModel.saveVersion()}>＋ 保存版本</button><button className="button button-outline" disabled={!rules.length || Boolean(project?.frozenVersionId)} onClick={() => viewModel.freeze()}>◈ 冻结当前</button></div></div>
@@ -30,13 +46,19 @@ export function InspectionView({ state, viewModel, onOpenRule }: InspectionViewP
   );
 }
 
-interface AnalysisPanelProps { analysis: RuleAnalysis; project: RuleProject; byId: Map<string, BusinessRule>; onOpenRule: (ruleId: string) => void }
+interface AnalysisPanelProps { analysis: RuleAnalysis; project: RuleProject; byId: Map<string, BusinessRule>; onOpenRule: (ruleId: string) => void; fresh: boolean; analysisStructureId: string | null; currentStructureId: string | null; checkedAt: number | null }
 
-function AnalysisPanel({ analysis, project, byId, onOpenRule }: AnalysisPanelProps) {
+function AnalysisPanel({ analysis, project, byId, onOpenRule, fresh, analysisStructureId, currentStructureId, checkedAt }: AnalysisPanelProps) {
   const conflictCount = analysis.overlaps.filter((overlap) => overlap.conflict).length;
   const overlapCount = analysis.overlaps.length;
   const coveredRules = Math.max(0, project.rules.length - analysis.unreachableRuleIds.length);
   return <>
+    <div className="freshness-strip">
+      <span className={`freshness-tag freshness-${fresh ? 'fresh' : 'stale'}`}><i />{fresh ? '结论为最新' : '结论已过期'}</span>
+      <span className="freshness-meta">结论对应结构 <code>{analysisStructureId ? shortStructureId(analysisStructureId) : '—'}</code></span>
+      {!fresh && <span className="freshness-meta">当前结构 <code>{currentStructureId ? shortStructureId(currentStructureId) : '—'}</code></span>}
+      {checkedAt && <span className="freshness-time">完成于 {formatTime(checkedAt)}</span>}
+    </div>
     <div className="analysis-summary">
       <MetricCard label="输入空间覆盖" value={`${analysis.coveragePercent}%`} detail={`${analysis.coveredCases} / ${analysis.checkedCases} 个代表分区`} icon="◌" tone={analysis.uncoveredExamples.length ? 'amber' : 'green'} />
       <MetricCard label="规则关系" value={`${overlapCount}`} detail={`${conflictCount} 个同优先级结果冲突`} icon="⇄" tone={conflictCount ? 'red' : 'blue'} />
@@ -79,4 +101,8 @@ function VersionRow({ version, index, current, onContinue, onCopy }: { version: 
 
 function formatDate(time: number): string {
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(time);
+}
+
+function formatTime(time: number): string {
+  return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(time);
 }

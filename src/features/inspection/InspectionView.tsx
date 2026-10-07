@@ -1,5 +1,5 @@
 import type { BusinessRule, RuleAnalysis, RuleProject, RuleVersion, SampleInput } from '../../models/ruleModel';
-import type { WorkspaceState } from '../../viewmodels/workspaceViewModel';
+import { isAnalysisCurrent, type WorkspaceState } from '../../viewmodels/workspaceViewModel';
 import type { InspectionViewModel } from './inspectionViewModel';
 
 interface InspectionViewProps { state: WorkspaceState; viewModel: InspectionViewModel; onOpenRule: (ruleId: string) => void }
@@ -7,7 +7,9 @@ interface InspectionViewProps { state: WorkspaceState; viewModel: InspectionView
 export function InspectionView({ state, viewModel, onOpenRule }: InspectionViewProps) {
   const project = state.project;
   const analysis = state.analysis;
+  const analysisFresh = isAnalysisCurrent(state);
   const isChecking = state.checkStatus === 'checking' || state.checkStatus === 'scheduled';
+  const analysisVersion = state.analysisMeta?.structureVersion;
   const rules = project?.rules ?? [];
   const byId = new Map(rules.map((rule) => [rule.id, rule]));
   return (
@@ -19,24 +21,40 @@ export function InspectionView({ state, viewModel, onOpenRule }: InspectionViewP
 
       {state.validationIssues.length > 0 && <div className="validation-banner"><strong>规则暂时无法检查</strong><span>{state.validationIssues[0].message}</span><button className="text-button" onClick={() => state.validationIssues[0].ruleId ? onOpenRule(state.validationIssues[0].ruleId) : undefined}>{state.validationIssues[0].ruleId ? '打开相关规则 →' : '修复项目定义'}</button></div>}
       {state.checkStatus === 'error' && !state.validationIssues.length && <div className="error-banner">检查失败：{state.notice}</div>}
-      {!analysis && !state.validationIssues.length && <div className="loading-analysis card-surface"><div className={isChecking ? 'spinner' : 'analysis-orb'}>{isChecking ? '' : '✳'}</div><div><strong>{isChecking ? '正在分析条件空间' : '准备检查规则集合'}</strong><p>{isChecking ? '计算在独立工作线程中运行，可随时取消。' : '点击“运行一致性检查”查看覆盖与规则关系。'}</p></div>{state.checkStatus === 'success' && <span className="success-mark">✓</span>}</div>}
-      {analysis && <AnalysisPanel analysis={analysis} project={project as RuleProject} byId={byId} onOpenRule={onOpenRule} />}
+      {analysis && !analysisFresh && <div className="stale-banner" role="status"><strong>结果已过期</strong><span>下方结论对应结构 v{analysisVersion ?? '—'}，当前已是 v{state.structureVersion}。{isChecking ? '正在按最新结构重新计算…' : '等待新检查完成，请勿按旧结论判断。'}</span><em>v{analysisVersion ?? '—'} → v{state.structureVersion}</em></div>}
+      {!analysis && !state.validationIssues.length && <div className="loading-analysis card-surface"><div className={isChecking ? 'spinner' : 'analysis-orb'}>{isChecking ? '' : '✳'}</div><div><strong>{isChecking ? `正在分析结构 v${state.structureVersion}` : '准备检查规则集合'}</strong><p>{isChecking ? '计算在独立工作线程中运行；旧结果返回时会自动作废。' : '点击“运行一致性检查”查看覆盖与规则关系。'}</p></div>{state.checkStatus === 'success' && <span className="success-mark">✓</span>}</div>}
+      {analysis && <AnalysisPanel analysis={analysis} project={project as RuleProject} byId={byId} fresh={analysisFresh} checkedAt={state.analysisMeta?.checkedAt} resultVersion={analysisVersion} currentVersion={state.structureVersion} onOpenRule={onOpenRule} />}
 
       <section className="versions-section">
         <div className="versions-heading"><div><span className="eyebrow">CHANGE HISTORY</span><h2>规则版本</h2><p>保存检查前后的结构快照。冻结后，当前规则只能通过复制版本继续修改。</p></div><div className="button-row"><button className="button button-subtle" disabled={!rules.length} onClick={() => viewModel.saveVersion()}>＋ 保存版本</button><button className="button button-outline" disabled={!rules.length || Boolean(project?.frozenVersionId)} onClick={() => viewModel.freeze()}>◈ 冻结当前</button></div></div>
-        {project?.versions.length ? <div className="version-list">{project.versions.map((version, index) => <VersionRow key={version.id} version={version} index={index} current={project.frozenVersionId === version.id} onContinue={() => viewModel.continueFrom(version.id)} onCopy={() => viewModel.copyToProject(version.id)} />)}</div> : <div className="version-empty card-surface"><span>◷</span><p>还没有保存版本。规则结构和检查结果确认后，可以创建第一个快照。</p></div>}
+        {project?.versions.length ? <div className="version-list">{project.versions.map((version, index) => <VersionRow key={version.id} version={version} index={index} current={project.frozenVersionId === version.id} currentStructureVersion={state.structureVersion} onContinue={() => viewModel.continueFrom(version.id)} onCopy={() => viewModel.copyToProject(version.id)} />)}</div> : <div className="version-empty card-surface"><span>◷</span><p>还没有保存版本。规则结构和检查结果确认后，可以创建第一个快照。</p></div>}
       </section>
     </section>
   );
 }
 
-interface AnalysisPanelProps { analysis: RuleAnalysis; project: RuleProject; byId: Map<string, BusinessRule>; onOpenRule: (ruleId: string) => void }
+interface AnalysisPanelProps {
+  analysis: RuleAnalysis;
+  project: RuleProject;
+  byId: Map<string, BusinessRule>;
+  fresh: boolean;
+  checkedAt?: number;
+  resultVersion?: number;
+  currentVersion: number;
+  onOpenRule: (ruleId: string) => void;
+}
 
-function AnalysisPanel({ analysis, project, byId, onOpenRule }: AnalysisPanelProps) {
+function AnalysisPanel({ analysis, project, byId, fresh, checkedAt, resultVersion, currentVersion, onOpenRule }: AnalysisPanelProps) {
   const conflictCount = analysis.overlaps.filter((overlap) => overlap.conflict).length;
   const overlapCount = analysis.overlaps.length;
   const coveredRules = Math.max(0, project.rules.length - analysis.unreachableRuleIds.length);
-  return <>
+  return <div className={`analysis-result ${fresh ? 'analysis-fresh' : 'analysis-stale'}`}>
+    <div className={`result-lineage ${fresh ? 'is-fresh' : 'is-stale'}`}>
+      <span className="result-lineage-dot" />
+      <strong>{fresh ? '新鲜结果' : '过期结果'}</strong>
+      <span>结论版本 v{resultVersion ?? '—'}{!fresh && <em> · 当前结构 v{currentVersion}</em>}</span>
+      {checkedAt && <small>{formatDate(checkedAt)} 完成</small>}
+    </div>
     <div className="analysis-summary">
       <MetricCard label="输入空间覆盖" value={`${analysis.coveragePercent}%`} detail={`${analysis.coveredCases} / ${analysis.checkedCases} 个代表分区`} icon="◌" tone={analysis.uncoveredExamples.length ? 'amber' : 'green'} />
       <MetricCard label="规则关系" value={`${overlapCount}`} detail={`${conflictCount} 个同优先级结果冲突`} icon="⇄" tone={conflictCount ? 'red' : 'blue'} />
@@ -57,7 +75,7 @@ function AnalysisPanel({ analysis, project, byId, onOpenRule }: AnalysisPanelPro
         {analysis.shadowedRuleIds.length ? <div className="compact-findings">{analysis.shadowedRuleIds.map((id) => <button className="compact-rule" key={id} onClick={() => onOpenRule(id)}><span>◉</span><strong>{byId.get(id)?.name ?? id}</strong><i>调整优先级 →</i></button>)}</div> : <SuccessEmpty text="没有被完全遮蔽的规则" />}
       </section>
     </div>
-  </>;
+  </div>;
 }
 
 function MetricCard({ label, value, detail, icon, tone }: { label: string; value: string; detail: string; icon: string; tone: string }) {
@@ -73,8 +91,9 @@ function formatWitness(values: SampleInput, project: RuleProject): string {
   }).join(' · ');
 }
 
-function VersionRow({ version, index, current, onContinue, onCopy }: { version: RuleVersion; index: number; current: boolean; onContinue: () => void; onCopy: () => void }) {
-  return <article className={`version-row${current ? ' version-current' : ''}`}><span className="version-number">{String(index + 1).padStart(2, '0')}</span><div className="version-copy"><strong>{version.name}{current && <em>当前冻结</em>}</strong><span>{formatDate(version.savedAt)} · {version.fields.length} 字段 · {version.rules.length} 条规则</span></div><div className="version-actions">{!version.frozen && <button className="text-button" onClick={onContinue}>从此版本继续</button>}<button className="text-button" onClick={onCopy}>复制为项目</button><span className={version.frozen ? 'version-state frozen' : 'version-state'}>{version.frozen ? '◈ 已冻结' : '◷ 快照'}</span></div></article>;
+function VersionRow({ version, index, current, currentStructureVersion, onContinue, onCopy }: { version: RuleVersion; index: number; current: boolean; currentStructureVersion: number; onContinue: () => void; onCopy: () => void }) {
+  const versionStructure = version.structureVersion ?? 1;
+  return <article className={`version-row${current ? ' version-current' : ''}`}><span className="version-number">{String(index + 1).padStart(2, '0')}</span><div className="version-copy"><strong>{version.name}{current && <em>当前冻结</em>}</strong><span>{formatDate(version.savedAt)} · 结构 v{versionStructure} · {version.fields.length} 字段 · {version.rules.length} 条规则</span></div><div className="version-actions">{!version.frozen && <button className="text-button" onClick={onContinue}>从此版本继续</button>}<button className="text-button" onClick={onCopy}>复制为项目</button><span className={version.frozen ? 'version-state frozen' : 'version-state'}>{version.frozen ? '◈ 已冻结' : versionStructure === currentStructureVersion ? '◷ 当前结构' : `↺ v${versionStructure}`}</span></div></article>;
 }
 
 function formatDate(time: number): string {

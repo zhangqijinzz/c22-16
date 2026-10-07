@@ -1,8 +1,15 @@
 import type { RuleAnalysis, RuleProject } from '../models/ruleModel';
+import { buildRuleStructureKey, getStructureVersion } from '../domain/ruleStructure';
 import RuleCheckWorker from './ruleCheck.worker?worker';
 
+export interface CheckResult {
+  analysis: RuleAnalysis;
+  structureKey: string;
+  structureVersion: number;
+}
+
 export interface CheckOperation {
-  promise: Promise<RuleAnalysis>;
+  promise: Promise<CheckResult>;
   cancel: () => void;
 }
 
@@ -12,16 +19,25 @@ export class RuleCheckService {
   run(project: RuleProject): CheckOperation {
     const worker = new RuleCheckWorker();
     const requestId = this.nextRequestId++;
+    const structureKey = buildRuleStructureKey(project);
+    const structureVersion = getStructureVersion(project);
     let rejectPending: (reason: Error) => void = () => undefined;
     let settled = false;
-    const promise = new Promise<RuleAnalysis>((resolve, reject) => {
+    const promise = new Promise<CheckResult>((resolve, reject) => {
       rejectPending = reject;
-      worker.onmessage = (event: MessageEvent<{ requestId: number; analysis?: RuleAnalysis; error?: string }>) => {
+      worker.onmessage = (event: MessageEvent<{ requestId: number; analysis?: RuleAnalysis; error?: string; structureKey?: string; structureVersion?: number }>) => {
         if (event.data.requestId !== requestId) return;
         settled = true;
         worker.terminate();
-        if (event.data.analysis) resolve(event.data.analysis);
-        else reject(new Error(event.data.error ?? '规则分析失败'));
+        if (event.data.analysis) {
+          resolve({
+            analysis: event.data.analysis,
+            structureKey: event.data.structureKey ?? structureKey,
+            structureVersion: event.data.structureVersion ?? structureVersion,
+          });
+        } else {
+          reject(new Error(event.data.error ?? '规则分析失败'));
+        }
       };
       worker.onerror = (event) => {
         settled = true;

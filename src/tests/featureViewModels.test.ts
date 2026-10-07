@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { buildRuleStructureKey, getStructureVersion } from '../domain/ruleStructure';
 import { FieldsViewModel } from '../features/fields/fieldsViewModel';
 import { RulesViewModel } from '../features/rules/rulesViewModel';
 import { SamplesViewModel } from '../features/samples/samplesViewModel';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
+import type { RuleProject } from '../models/ruleModel';
 
 class MemoryRepository {
   async load() { return null; }
@@ -10,7 +12,16 @@ class MemoryRepository {
 }
 
 class FakeChecker {
-  run() { return { promise: Promise.resolve({ checkedCases: 1, coveredCases: 1, coveragePercent: 100, overlaps: [], unreachableRuleIds: [], shadowedRuleIds: [], uncoveredExamples: [], truncated: false }), cancel() {} }; }
+  run(project: RuleProject) {
+    return {
+      promise: Promise.resolve({
+        analysis: { checkedCases: 1, coveredCases: 1, coveragePercent: 100, overlaps: [], unreachableRuleIds: [], shadowedRuleIds: [], uncoveredExamples: [], truncated: false },
+        structureKey: buildRuleStructureKey(project),
+        structureVersion: getStructureVersion(project),
+      }),
+      cancel() {},
+    };
+  }
 }
 
 describe('feature ViewModels', () => {

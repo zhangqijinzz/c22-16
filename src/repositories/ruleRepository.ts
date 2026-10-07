@@ -42,6 +42,7 @@ function decodeProject(value: unknown): RuleProject | null {
     rules,
     sampleInputs: isRecord(value.sampleInputs) ? value.sampleInputs as RuleProject['sampleInputs'] : defaultSample(fields),
     versions,
+    structureVersion: typeof value.structureVersion === 'number' && value.structureVersion > 0 ? value.structureVersion : 1,
     updatedAt: value.updatedAt,
   };
   if (typeof value.frozenVersionId === 'string') project.frozenVersionId = value.frozenVersionId;

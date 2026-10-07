@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { analyzeRules } from '../domain/ruleAnalysis';
+import { buildRuleStructureKey, getStructureVersion } from '../domain/ruleStructure';
 import type { RuleProject, WorkspaceDocument } from '../models/ruleModel';
-import type { CheckOperation } from '../services/ruleCheckService';
-import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
+import type { CheckOperation, CheckResult } from '../services/ruleCheckService';
+import { RuleWorkspaceViewModel, isAnalysisCurrent } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
@@ -22,7 +23,37 @@ class FakeChecker {
       this.nextError = null;
       return { promise: Promise.reject(error), cancel: () => { this.cancelled = true; } };
     }
-    return { promise: Promise.resolve(analyzeRules(project)), cancel: () => { this.cancelled = true; } };
+    return {
+      promise: Promise.resolve({
+        analysis: analyzeRules(project),
+        structureKey: buildRuleStructureKey(project),
+        structureVersion: getStructureVersion(project),
+      }),
+      cancel: () => { this.cancelled = true; },
+    };
+  }
+}
+
+class DeferredChecker {
+  readonly operations: { project: RuleProject; key: string; version: number; resolve: (result: CheckResult) => void; reject: (error: Error) => void; cancelled: boolean }[] = [];
+
+  run(project: RuleProject): CheckOperation {
+    const operation = {
+      project,
+      key: buildRuleStructureKey(project),
+      version: getStructureVersion(project),
+      resolve: undefined as unknown as (result: CheckResult) => void,
+      reject: undefined as unknown as (error: Error) => void,
+      cancelled: false,
+    };
+    this.operations.push(operation);
+    return {
+      promise: new Promise<CheckResult>((resolve, reject) => {
+        operation.resolve = resolve;
+        operation.reject = reject;
+      }),
+      cancel: () => { operation.cancelled = true; },
+    };
   }
 }
 
@@ -82,12 +113,108 @@ describe('RuleWorkspaceViewModel', () => {
     workspace.dispose();
   });
 
+  it('keeps successful analysis bound to its structure version and marks later structural edits stale', async () => {
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), new FakeChecker());
+    await workspace.start();
+    await workspace.runCheck();
+
+    const firstState = workspace.getSnapshot();
+    expect(firstState.structureVersion).toBe(1);
+    expect(firstState.analysisMeta?.structureVersion).toBe(1);
+    expect(isAnalysisCurrent(firstState)).toBe(true);
+
+    const sameStructure = firstState.project as RuleProject;
+    workspace.commitProject({ ...sameStructure, title: '只改名称' }, '非结构编辑', { recheck: false });
+    expect(workspace.getSnapshot().structureVersion).toBe(1);
+    expect(isAnalysisCurrent(workspace.getSnapshot())).toBe(true);
+
+    const changedStructure = workspace.getSnapshot().project as RuleProject;
+    workspace.commitProject({
+      ...changedStructure,
+      rules: changedStructure.rules.map((rule, index) => index === 0 ? { ...rule, result: `${rule.result}（新）` } : rule),
+    }, '调整规则结果');
+    expect(workspace.getSnapshot().structureVersion).toBe(2);
+    expect(workspace.getSnapshot().analysisMeta?.structureVersion).toBe(1);
+    expect(workspace.getSnapshot().checkStatus).toBe('scheduled');
+    expect(isAnalysisCurrent(workspace.getSnapshot())).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(220);
+    const refreshed = workspace.getSnapshot();
+    expect(refreshed.checkStatus).toBe('success');
+    expect(refreshed.analysisMeta?.structureVersion).toBe(2);
+    expect(isAnalysisCurrent(refreshed)).toBe(true);
+    workspace.dispose();
+  });
+
+  it('rejects a worker result whose structure key does not match the requested structure', async () => {
+    const checker = new DeferredChecker();
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), checker);
+    await workspace.start();
+    const staleCheck = workspace.runCheck();
+    const stale = checker.operations[0];
+    stale.resolve({ analysis: analyzeRules(stale.project), structureKey: 'stale-structure-key', structureVersion: stale.version });
+    await staleCheck;
+    await Promise.resolve();
+
+    expect(workspace.getSnapshot().analysis).toBeNull();
+    expect(workspace.getSnapshot().phase).toBe('error');
+    expect(workspace.getSnapshot().notice).toContain('已作废');
+
+    const retry = workspace.runCheck();
+    const latest = checker.operations[1];
+    latest.resolve({ analysis: analyzeRules(latest.project), structureKey: latest.key, structureVersion: latest.version });
+    await retry;
+
+    expect(workspace.getSnapshot().analysisMeta?.structureKey).toBe(latest.key);
+    expect(isAnalysisCurrent(workspace.getSnapshot())).toBe(true);
+    workspace.dispose();
+  });
+
+  it('uses only the last scheduled structure after repeated edits and cancellations', async () => {
+    const checker = new DeferredChecker();
+    const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), checker);
+    await workspace.start();
+    void workspace.runCheck();
+    const firstOperation = checker.operations[0];
+
+    const changeRuleResult = (suffix: string) => {
+      const project = workspace.getSnapshot().project as RuleProject;
+      workspace.commitProject({
+        ...project,
+        rules: project.rules.map((rule, index) => index === 0 ? { ...rule, result: `${rule.result}${suffix}` } : rule),
+      }, '连续编辑规则');
+    };
+
+    changeRuleResult(' · 第二版');
+    expect(workspace.getSnapshot().structureVersion).toBe(2);
+    expect(firstOperation.cancelled).toBe(true);
+    await Promise.resolve();
+    changeRuleResult(' · 第三版');
+    expect(workspace.getSnapshot().structureVersion).toBe(3);
+    expect(checker.operations).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(220);
+    expect(checker.operations).toHaveLength(2);
+    const lastOperation = checker.operations[1];
+    expect(lastOperation.cancelled).toBe(false);
+    lastOperation.resolve({ analysis: analyzeRules(lastOperation.project), structureKey: lastOperation.key, structureVersion: lastOperation.version });
+    await Promise.resolve();
+
+    const finalState = workspace.getSnapshot();
+    expect(finalState.checkStatus).toBe('success');
+    expect(finalState.structureVersion).toBe(3);
+    expect(finalState.analysisMeta?.structureVersion).toBe(3);
+    expect(isAnalysisCurrent(finalState)).toBe(true);
+    workspace.dispose();
+  });
   it('saves versions, freezes and resumes a version, and copies it into a new project', async () => {
     const workspace = new RuleWorkspaceViewModel(new MemoryRepository(), new FakeChecker());
     await workspace.start();
     workspace.saveVersion();
     const savedVersion = workspace.getSnapshot().project?.versions[0];
     expect(savedVersion?.frozen).toBe(false);
+    expect(savedVersion?.structureVersion).toBe(1);
+    expect(workspace.getSnapshot().structureVersion).toBe(1);
 
     workspace.freezeCurrent();
     const frozen = workspace.getSnapshot().project;

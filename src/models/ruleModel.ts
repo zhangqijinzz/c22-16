@@ -45,6 +45,7 @@ export interface RuleVersion {
   name: string;
   savedAt: number;
   frozen: boolean;
+  structureVersion?: number;
   fields: RuleField[];
   rules: BusinessRule[];
   sampleInputs: SampleInput;
@@ -57,6 +58,7 @@ export interface RuleProject {
   rules: BusinessRule[];
   sampleInputs: SampleInput;
   versions: RuleVersion[];
+  structureVersion?: number;
   frozenVersionId?: string;
   updatedAt: number;
 }

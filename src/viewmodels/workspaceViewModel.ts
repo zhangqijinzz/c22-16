@@ -1,5 +1,6 @@
 import { evaluateSample } from '../domain/conditionEvaluator';
 import { ruleDomain } from '../domain/ruleDomain';
+import { buildRuleStructureKey, getStructureVersion, nextStructureVersion, withStructureVersion } from '../domain/ruleStructure';
 import type {
   ModuleId,
   RuleAnalysis,
@@ -16,6 +17,12 @@ import type { WorkspacePort } from './workspacePort';
 export type WorkspacePhase = 'loading' | 'editing' | 'validating' | 'checking' | 'ready' | 'error';
 export type CheckStatus = 'idle' | 'scheduled' | 'checking' | 'success' | 'error' | 'cancelled';
 
+export interface AnalysisMetadata {
+  structureKey: string;
+  structureVersion: number;
+  checkedAt: number;
+}
+
 export interface WorkspaceState {
   phase: WorkspacePhase;
   persistence: 'idle' | 'saving' | 'saved' | 'error';
@@ -24,6 +31,9 @@ export interface WorkspaceState {
   activeModule: ModuleId;
   checkStatus: CheckStatus;
   analysis: RuleAnalysis | null;
+  analysisMeta: AnalysisMetadata | null;
+  structureKey: string | null;
+  structureVersion: number;
   validationIssues: ReturnType<typeof ruleDomain.validateProject>;
   sampleEvaluation: SampleEvaluation | null;
   selectedRuleId?: string;
@@ -35,10 +45,20 @@ type Listener = () => void;
 type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save'>;
 type Checker = Pick<RuleCheckService, 'run'>;
 
+export function isAnalysisCurrent(state: Pick<WorkspaceState, 'analysis' | 'analysisMeta' | 'structureKey' | 'structureVersion'>): boolean {
+  return Boolean(
+    state.analysis
+    && state.analysisMeta
+    && state.structureKey === state.analysisMeta.structureKey
+    && state.structureVersion === state.analysisMeta.structureVersion,
+  );
+}
+
 export class RuleWorkspaceViewModel implements WorkspacePort {
   private state: WorkspaceState = {
     phase: 'loading', persistence: 'idle', workspace: null, project: null,
-    activeModule: 'inspection', checkStatus: 'idle', analysis: null,
+    activeModule: 'inspection', checkStatus: 'idle', analysis: null, analysisMeta: null,
+    structureKey: null, structureVersion: 1,
     validationIssues: [], sampleEvaluation: null, notice: '正在恢复本地规则项目…',
   };
   private readonly listeners = new Set<Listener>();
@@ -90,7 +110,11 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       this.updateView({ notice: '当前版本已冻结。请先从版本记录中复制一份继续编辑。' });
       return false;
     }
-    this.replaceProject({ ...project, updatedAt: Date.now() }, notice, options.recheck !== false);
+    const next = withStructureVersion(
+      { ...project, updatedAt: Date.now() },
+      nextStructureVersion(current, project),
+    );
+    this.replaceProject(next, notice, options.recheck !== false);
     return true;
   }
 
@@ -121,16 +145,28 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       this.publish({ ...this.state, phase: 'validating', checkStatus: 'error', validationIssues: issues, notice: issues[0].message });
       return;
     }
-    this.checkOperation?.cancel();
+    this.cancelPendingCheck();
     const revision = ++this.checkRevision;
-    this.publish({ ...this.state, phase: 'checking', checkStatus: 'checking', notice: '正在工作线程中枚举输入空间…' });
+    const requestedStructureKey = this.state.structureKey;
+    const requestedStructureVersion = this.state.structureVersion;
+    if (!requestedStructureKey) return;
+    this.publish({ ...this.state, phase: 'checking', checkStatus: 'checking', notice: `正在检查结构 v${requestedStructureVersion}…` });
     try {
       const operation = this.checker.run(project);
       this.checkOperation = operation;
-      const analysis = await operation.promise;
+      const result = await operation.promise;
       if (revision !== this.checkRevision) return;
       this.checkOperation = undefined;
-      this.publish({ ...this.state, phase: 'ready', checkStatus: 'success', analysis, notice: `检查完成：已分析 ${analysis.checkedCases.toLocaleString('zh-CN')} 个逻辑分区` });
+      if (result.structureKey !== requestedStructureKey || result.structureVersion !== requestedStructureVersion) {
+        this.publish({ ...this.state, phase: 'error', checkStatus: 'error', notice: '返回的检查结论已不匹配当前结构，已作废。请重新运行检查。' });
+        return;
+      }
+      const analysisMeta = {
+        structureKey: requestedStructureKey,
+        structureVersion: result.structureVersion,
+        checkedAt: Date.now(),
+      };
+      this.publish({ ...this.state, phase: 'ready', checkStatus: 'success', analysis: result.analysis, analysisMeta, notice: `检查完成：结构 v${requestedStructureVersion}，已分析 ${result.analysis.checkedCases.toLocaleString('zh-CN')} 个逻辑分区` });
     } catch (error) {
       if (revision !== this.checkRevision) return;
       this.checkOperation = undefined;
@@ -144,12 +180,9 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   }
 
   cancelCheck(): void {
-    if (this.checkTimer) clearTimeout(this.checkTimer);
-    this.checkTimer = undefined;
-    this.checkRevision += 1;
-    this.checkOperation?.cancel();
-    this.checkOperation = undefined;
-    if (this.state.checkStatus === 'checking' || this.state.checkStatus === 'scheduled') {
+    const wasActive = this.state.checkStatus === 'checking' || this.state.checkStatus === 'scheduled';
+    this.cancelPendingCheck();
+    if (wasActive) {
       this.publish({ ...this.state, phase: 'editing', checkStatus: 'cancelled', notice: '检查已取消' });
     }
   }
@@ -159,7 +192,14 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     if (!workspace) return;
     const project = createBlankProject(workspace.projects.length + 1);
     const next: WorkspaceDocument = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
-    this.publish({ ...this.state, workspace: next, project, phase: 'validating', activeModule: 'fields', analysis: null, checkStatus: 'idle', validationIssues: ruleDomain.validateProject(project), sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: undefined, notice: '空项目已创建。先定义字段，再添加规则。' });
+    this.cancelPendingCheck();
+    this.publish({
+      ...this.state, workspace: next, project, phase: 'validating', activeModule: 'fields',
+      analysis: null, analysisMeta: null, checkStatus: 'idle', structureKey: buildRuleStructureKey(project),
+      structureVersion: getStructureVersion(project), validationIssues: ruleDomain.validateProject(project),
+      sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: undefined,
+      notice: '空项目已创建。先定义字段，再添加规则。',
+    });
     this.scheduleSave(next);
   }
 
@@ -170,7 +210,15 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     this.cancelCheck();
     const next = { ...workspace, activeProjectId: projectId };
     const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已切换到“${project.title}”` });
+    const structureKey = buildRuleStructureKey(project);
+    const structureVersion = getStructureVersion(project);
+    this.publish({
+      ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'inspection',
+      checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, analysisMeta: null,
+      structureKey, structureVersion, validationIssues: issues,
+      sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id,
+      notice: `已切换到“${project.title}”`,
+    });
     this.scheduleSave(next);
     if (!issues.length) this.scheduleCheck(80);
   }
@@ -193,7 +241,9 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const project = this.state.project;
     const version = project?.versions.find((candidate) => candidate.id === versionId);
     if (!project || !version) return;
-    this.replaceProject({ ...project, fields: cloneData(version.fields), rules: cloneData(version.rules), sampleInputs: cloneData(version.sampleInputs), frozenVersionId: undefined }, `已从“${version.name}”建立可编辑版本`, true, true);
+    const restored: RuleProject = { ...project, fields: cloneData(version.fields), rules: cloneData(version.rules), sampleInputs: cloneData(version.sampleInputs), frozenVersionId: undefined };
+    const next = withStructureVersion(restored, nextStructureVersion(project, restored));
+    this.replaceProject(next, `已从“${version.name}”建立可编辑版本`, true, true);
     this.navigate('rules');
   }
 
@@ -205,11 +255,20 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const project: RuleProject = {
       id: makeId('project'), title: `${source.title} · ${version.name}副本`,
       fields: cloneData(version.fields), rules: cloneData(version.rules), sampleInputs: cloneData(version.sampleInputs),
-      versions: [], updatedAt: Date.now(),
+      versions: [], structureVersion: 1, updatedAt: Date.now(),
     };
     const next = { ...workspace, projects: [...workspace.projects, project], activeProjectId: project.id };
     const issues = ruleDomain.validateProject(project);
-    this.publish({ ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'rules', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: `已复制版本到项目“${project.title}”` });
+    const structureKey = buildRuleStructureKey(project);
+    const structureVersion = getStructureVersion(project);
+    this.cancelPendingCheck();
+    this.publish({
+      ...this.state, workspace: next, project, phase: issues.length ? 'validating' : 'editing', activeModule: 'rules',
+      checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, analysisMeta: null,
+      structureKey, structureVersion, validationIssues: issues,
+      sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id,
+      notice: `已复制版本到项目“${project.title}”`,
+    });
     this.scheduleSave(next);
     if (!issues.length) this.scheduleCheck(80);
   }
@@ -221,9 +280,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       const workspace = saved ?? createDemoWorkspace();
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
       const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
-      if (saved) this.scheduleCheck(40);
-      else {
+      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', analysis: null, analysisMeta: null, structureKey: buildRuleStructureKey(project), structureVersion: getStructureVersion(project), validationIssues: issues, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
+      if (saved) {
+        if (!issues.length) this.scheduleCheck(40);
+      } else {
         this.scheduleSave(workspace);
         if (!issues.length) this.scheduleCheck(40);
       }
@@ -240,15 +300,24 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       return;
     }
     const updated = { ...project, updatedAt: Date.now() };
-    const next = { ...workspace, projects: workspace.projects.map((candidate) => candidate.id === updated.id ? updated : candidate) };
     const issues = ruleDomain.validateProject(updated);
+    const normalized: RuleProject = this.state.project
+      ? withStructureVersion(updated, nextStructureVersion(this.state.project, updated))
+      : withStructureVersion(updated, getStructureVersion(updated));
+    const structureKey = buildRuleStructureKey(normalized);
+    const next = { ...workspace, projects: workspace.projects.map((candidate) => candidate.id === normalized.id ? normalized : candidate) };
     this.publish({
-      ...this.state, workspace: next, project: updated,
+      ...this.state, workspace: next, project: normalized,
       phase: issues.length ? 'validating' : 'editing', validationIssues: issues,
-      checkStatus: issues.length ? 'idle' : recheck ? 'scheduled' : this.state.checkStatus,
-      analysis: recheck ? null : this.state.analysis,
-      sampleEvaluation: evaluateSample(updated, updated.sampleInputs),
-      selectedRuleId: updated.rules.some((rule) => rule.id === this.state.selectedRuleId) ? this.state.selectedRuleId : updated.rules[0]?.id,
+      checkStatus: issues.length
+        ? (this.state.checkStatus === 'checking' || this.state.checkStatus === 'scheduled' ? 'cancelled' : this.state.checkStatus)
+        : recheck ? 'scheduled' : this.state.checkStatus,
+      analysis: this.state.analysis,
+      analysisMeta: this.state.analysisMeta,
+      structureKey,
+      structureVersion: getStructureVersion(normalized),
+      sampleEvaluation: evaluateSample(normalized, normalized.sampleInputs),
+      selectedRuleId: normalized.rules.some((rule) => rule.id === this.state.selectedRuleId) ? this.state.selectedRuleId : normalized.rules[0]?.id,
       notice,
     });
     this.scheduleSave(next);
@@ -266,8 +335,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   }
 
   private cancelPendingCheck(): void {
-    if (this.checkTimer) clearTimeout(this.checkTimer);
-    this.checkTimer = undefined;
+    if (this.checkTimer) {
+      clearTimeout(this.checkTimer);
+      this.checkTimer = undefined;
+    }
     if (this.checkOperation) {
       this.checkRevision += 1;
       this.checkOperation.cancel();
